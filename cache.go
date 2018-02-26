@@ -32,7 +32,7 @@ func OpenCache(path string) (*Cache, error) {
 	}, nil
 }
 
-func OpenDefaultCache(l *log.Logger) (*Cache, error) {
+func OpenDefaultCache() (*Cache, error) {
 	cacheDir, err := basedir.Cache.EnsureDir("thumbs.leveldb", 0777)
 	if err != nil {
 		return nil, err
