@@ -10,8 +10,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sync"
 
+	"github.com/pkg/errors"
 	"github.com/tajtiattila/metadata"
 	"github.com/tajtiattila/metadata/orient"
 
@@ -48,40 +48,41 @@ func hasMagick() bool {
 	return !magick.broken
 }
 
-// File returns the thumb of the file.
-func File(path string, maxw, maxh int) Thumb {
+// File returns the Thumb of the file.
+func File(path string, maxw, maxh int) (*Thumb, error) {
 	if hasMagick() {
 		r, err := magickThumb(path, maxw, maxh)
 		if err == nil {
-			return r
+			return r, nil
 		}
 	}
 
 	return pureThumb(path, maxw, maxh)
 }
 
-func FromReader(r io.Reader, maxw, maxh int) Thumb {
+// FromReader returns the Thumb for r.
+func FromReader(r io.Reader, maxw, maxh int) (*Thumb, error) {
 	raw, err := ioutil.ReadAll(r)
 	if err != nil {
-		return errThumb(err)
+		return nil, err
 	}
 
 	return pureThumbBytes(raw, maxw, maxh)
 }
 
-func pureThumb(fn string, maxw, maxh int) Thumb {
+func pureThumb(fn string, maxw, maxh int) (*Thumb, error) {
 	raw, err := ioutil.ReadFile(fn)
 	if err != nil {
-		return errThumb(err)
+		return nil, err
 	}
 
 	return pureThumbBytes(raw, maxw, maxh)
 }
 
-func pureThumbBytes(raw []byte, maxw, maxh int) Thumb {
+func pureThumbBytes(raw []byte, maxw, maxh int) (*Thumb, error) {
 	im, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return errThumb(err)
+		return nil, err
 	}
 
 	m, err := metadata.Parse(bytes.NewReader(raw))
@@ -107,7 +108,20 @@ func pureThumbBytes(raw []byte, maxw, maxh int) Thumb {
 		t = orient.Orient(t, m.Orientation)
 	}
 
-	return &thumb{im: t}
+	buf := new(bytes.Buffer)
+	if err := jpeg.Encode(buf, t, nil); err != nil {
+		return nil, err
+	}
+
+	thumb := &Thumb{
+		Jpeg: buf.Bytes(),
+		Dx:   t.Bounds().Dx(),
+		Dy:   t.Bounds().Dy(),
+	}
+	if m != nil {
+		thumb.Meta = *m
+	}
+	return thumb, nil
 }
 
 func thumbSize(im image.Image, maxw, maxh int) (w, h int) {
@@ -123,7 +137,7 @@ func thumbSize(im image.Image, maxw, maxh int) (w, h int) {
 	return maxw, h
 }
 
-func magickThumb(fn string, maxw, maxh int) (Thumb, error) {
+func magickThumb(fn string, maxw, maxh int) (*Thumb, error) {
 	cmd := exec.Command(magick.path, "convert",
 		"-auto-orient",
 		"-thumbnail", fmt.Sprintf("%dx%d", maxw, maxh),
@@ -135,67 +149,53 @@ func magickThumb(fn string, maxw, maxh int) (Thumb, error) {
 	if err := cmd.Start(); err != nil {
 		log.Println("magick failed with", err)
 		magick.broken = true
-		return nil, err
+		return nil, errors.Wrapf(err, "can't start to get thumb of %q", fn)
 	}
-	buf, err := ioutil.ReadAll(stdout)
+	raw, err := ioutil.ReadAll(stdout)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "can't read magick thumb of %q", fn)
 	}
 	if err := cmd.Wait(); err != nil {
 		return nil, err
 	}
-	return &thumb{raw: buf}, nil
-}
 
-type Thumb interface {
-	JpegBytes() ([]byte, error)
-	Image() (image.Image, error)
-}
-
-type errorThumb struct {
-	err error
-}
-
-func errThumb(err error) Thumb { return &errorThumb{err: err} }
-
-func (t *errorThumb) JpegBytes() ([]byte, error)  { return nil, t.err }
-func (t *errorThumb) Image() (image.Image, error) { return nil, t.err }
-
-type thumb struct {
-	mu  sync.Mutex
-	raw []byte
-	im  image.Image
-}
-
-func (t *thumb) JpegBytes() ([]byte, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.raw == nil {
-		if t.im == nil {
-			panic("internal: thumb image is nil")
-		}
-		b := new(bytes.Buffer)
-		err := jpeg.Encode(b, t.im, nil)
-		if err != nil {
-			return nil, err
-		}
-		t.raw = b.Bytes()
+	conf, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, errors.Wrapf(err, "can't decode magick thumb of %q", fn)
 	}
-	return t.raw, nil
+
+	f, err := os.Open(fn)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	m, err := metadata.Parse(f)
+	if err != nil && err != metadata.ErrUnknownFormat {
+		log.Println("metadata:", err)
+	}
+
+	thumb := &Thumb{
+		Jpeg: raw,
+		Dx:   conf.Width,
+		Dy:   conf.Height,
+	}
+
+	if m != nil {
+		thumb.Meta = *m
+	}
+
+	return thumb, nil
 }
 
-func (t *thumb) Image() (image.Image, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.im == nil {
-		if t.raw == nil {
-			panic("internal: thumb image is nil")
-		}
-		im, _, err := image.Decode(bytes.NewReader(t.raw))
-		if err != nil {
-			return nil, err
-		}
-		t.im = im
-	}
-	return t.im, nil
+// Thumb holds a JPEG thumbnail and metadata of an image.
+type Thumb struct {
+	// Raw JPEG thumbnail
+	Jpeg []byte
+
+	// Thumbnail dimensions
+	Dx, Dy int
+
+	// Exif/XMP metadata of original image
+	Meta metadata.Metadata
 }
